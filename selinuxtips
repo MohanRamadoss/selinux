@@ -1,0 +1,207 @@
+compile a SELinux policy package
+
+
+he Scenario
+The scenario described here is not made up – I came across this problem while working on Efficient Rails DevOps.
+
+I usually host Rails applications in the /var/www directory on my servers, each in a dedicated folder (/var/www/myapp, /var/www/myotherapp and so on). Not only the apps' codebases and precompiled assets lie there, but also logs (for the application server and the webserver's vhost), PIDs of the application server, temporary files and (quite important) the sockets nginx uses to forward requests to the application server.
+
+Each application has its own vhost, which looks roughly like this (given a sample application named myapp):
+
+upstream myapp {
+  server unix:/var/www/myapp/shared/sockets/unicorn.sock fail_timeout=0;
+}
+
+server {
+  listen 80;
+  server_name www.myapp.com;
+  root /var/www/myapp/application/public;
+  access_log /var/log/nginx/access.myapp.log;
+
+  ...
+
+  location / {
+    try_files $uri @app;
+  }
+
+  location @app {
+    proxy_pass http://myapp;
+    ...
+  }
+}
+Now imagine everything for this application is prepared (the database is created and migrated, assets are precompiled and everything is configured correctly). SELinux prevents this application from being run properly because our application server's socket (/var/www/myapp/shared/sockets/unicorn.sock) cannot be read or written.
+
+To make things interesting, examining nginx' error.log you are just presented with permission denied errors with no hint about SELinux. SELinux runs as a kernel extension, so most tools are not aware of SELinux denials (they could know but this functionality is not implemented in most tools).
+
+How to know that this is a SELinux issue
+Usually SELinux problems show themselves as file not found or permission denied errors, even though the files/directories in question are present and are assigned the proper mode.
+
+It is absolutely normal that you think of an SELinux problem not until you have triple-checked owner, group and permissions of every file which could possibly be involved. This can lead to serious doubt about your general Linux knowledge.
+
+To quickly find out if you are experiencing a SELinux issue, temporarily set SELinux' mode from enforcing to permissive with the command setenforce 0. If everything suddenly works, you can be sure that there is a problem with your current SELinux policy.
+
+By default, SELinux incidents are logged by the auditd daemon. While in permissive mode, you can take a live look at auditd's log (tail -f /var/log/audit/audit.log) while executing the commands in question to get an overview of what actions would be denied in enforcing mode.
+
+Building a policy module
+It is possible to build a policy module to allow certain actions which are permitted by default.
+
+First, it is a good idea to clear the audit log to have just incidents related to our problem in our log:
+
+> /var/log/audit/audit.log
+While still in permissive mode, run all actions in question again – in my case this was starting, stopping and restarting the nginx webserver, running my deploy script and requesting the website with a browser. This will add quite a bunch of lines to the audit log.
+
+You can then use this log to build the policy module. To do that, you will need some SELinux-specific commands which can be installed with yum install policycoreutils-python.
+
+Now dump the audit log through the audit2allow command to see what SELinux rules need to be changed in order to allow the actions which were forbidden according to our log:
+
+cat /var/log/audit/audit.log | audit2allow -m myapp
+This would generate the following output:
+
+module myapp 1.0;
+
+require {
+  type httpd_t;
+  type httpd_sys_content_t;
+  type initrc_t;
+  class sock_file write;
+  class unix_stream_socket connectto;
+}
+
+#============= httpd_t ==============
+allow httpd_t httpd_sys_content_t:sock_file write;
+allow httpd_t initrc_t:unix_stream_socket connectto;
+Now we could rerun this command with a slightly different flag (-M for -m):
+
+cat /var/log/audit/audit.log | audit2allow -M myapp
+This would give us a myapp.pp file in our current working directory which we could integrate in our SELinux policy right away.
+
+However, I recommend a different approach:
+
+We take the previous command's output and save it as a type enforcement file:
+
+cat /var/log/audit/audit.log | audit2allow -m myapp > myapp.te
+This has two major benefits:
+
+Before compiling a policy package, we should always check if our type enforcement file does not allow too much or could be tweaked in another way.
+Type enforcement files are human-readable (compiled policy packages are not), so we can keep them for later reference (maybe in our Ansible playbook).
+In order to build a policy package from a type enforcement file, we first have to convert it into a policy module. This is done with the checkmodule command:
+
+checkmodule -M -m -o myapp.mod myapp.te
+This command will take our myapp.te file and create a myapp.mod policy module in our current working directory.
+
+We can now take this policy module and compile it:
+
+semodule_package -o myapp.pp -m myapp.mod
+This command will result in a policy package called myapp.pp in our working directory.
+
+This generated policy package can now be loaded with the semodule command:
+
+semodule -i myapp.pp
+When the policy package is loaded, our webserver will no longer have problems connecting to our application server's socket and the Rails application will be served properly. Should other SELinux denials occur after loading the new policy package, it's rinse and repeat.
+
+A word on efficiency
+When you are tweaking your policy package, it can be quite tedious repeating these steps over and over. When tweaking the type enforcement file, the following steps are necessary to load the new module:
+
+Remove the policy package (semodule -r myapp)
+Delete all generated files (rm -f myapp.mod myapp.pp)
+Tweak the type enforcement file
+Build the policy module (checkmodule -M -m -o myapp.mod myapp.te)
+Build the policy package (semodule_package -o myapp.pp -m myapp.mod)
+Load the policy package (semodule -i myapp.pp)
+You can save a great amount of time if you wrap these commands in a small bash script:
+
+#!/bin/bash
+
+cd
+semodule -r myapp
+rm -f myapp.mod myapp.pp
+checkmodule -M -m -o myapp.mod myapp.te
+semodule_package -o myapp.pp -m myapp.mod
+semodule -i myapp.pp
+When provisioning your server, think about live-compiling the policy package instead of using a precompiled one. While you save some time by using a precompiled myapp.pp file, you may risk using an outdated one (which may not be compiled from the myapp.te file in your repository).
+
+If you are using Ansible to provision your servers, the tasks of a role for compiling and loading a policy package may look like this (given a files directory containing the myapp.te file):
+
+- name: Install tools
+  yum: pkg=policycoreutils-python
+       state=installed
+
+- name: Remove SELinux policy package
+  command: semodule -r myapp
+  failed_when: false
+
+- name: Copy SELinux type enforcement file
+  copy: src=myapp.te
+        dest=/tmp/
+
+- name: Compile SELinux module file
+  command: checkmodule -M -m -o /tmp/myapp.mod /tmp/myapp.te
+
+- name: Build SELinux policy package
+  command: semodule_package -o /tmp/myapp.pp -m /tmp/myapp.mod
+
+- name: Load SELinux policy package
+  command: semodule -i /tmp/myapp.pp
+
+- name: Remove temporary files
+  file: path=/tmp/myapp.*
+        state=absent
+Disclaimer
+When used correctly, SELinux adds a lot to your server's security. When you run into problems with certain commands being denied, you should first make sure that you truly understand what causes the error.
+
+Chances are very high that SELinux complains for a reason. Often you can avoid the problem altogether by rethinking where you put which files.
+
+When you are absolutely sure that you need to build a new policy package, do yourself a favor and research thoroughly what each added rule does – it is only too easy to create security holes which would defeat SELinux' purpose.
+
+
+
+
+** Checking the denials:
+1) Print the denials
+ # audit2allow -i /var/log/audit/audit.log
+  ###============= httpd_t ==============
+  allow httpd_t tmp_t:file { read getattr ioctl };
+  ###============= ntpd_t ==============
+  allow ntpd_t file_t:file { read unlink };
+  ###============= postfix_postdrop_t ==============
+  allow postfix_postdrop_t httpd_log_t:file getattr;
+2) Automatically create policy:
+ # egrep "system_mail_t || postfix_postdrop_t || httpd_t" /var/log/audit/audit.log | audit2allow -R
+3) Automatically build policy and then install:
+ # egrep "system_mail_t || postfix_postdrop_t || httpd_t" /var/log/audit/audit.log | audit2allow -M rtracker
+ # semodule -i rtracker.pp
+4) Build policy and then install in proper manner:
+ # yum install selinux-policy-devel
+ # cd /usr/share/selinux/devel
+ Create rtracker.te file using -R option.
+ # make rtracker.pp
+ # semodule -i rtracker.pp
+ (This is vital for policy update later)
+5) Update your policy (remember to increment the policy name by 1 e.g 1.0.1)
+ # make rtracker.pp
+ # semodule -u rtracker
+6) Remove some policy
+ # semodule -r rtracker
+Note:
+1) For audit2allow to work:
+ # yum install audit2allow policycoreutils policycoreutils-python
+ # service syslog restart; service auditd restart (same will be follow if you truncate audit log  file)
+2) While using -R flag with audit2allow if you get this error:
+ Error: could not open interface info [/var/lib/sepolgen/interface_info]
+ Then install:
+ # yum install epolgen-ifgen
+3) syntax use in .te file for policy name and version:
+ policy_module(rtracker,1.0.0) OR
+ module rtracker 1.0.0
+4) Enable some module(you can check the status of module using "semodule -l | grep rtracker"):
+    $ semodule --enable=rtracker 
+
+*NOTE: If you are installing same policy on a number of servers then you don't need to install selinux-policy-devel and build on each instance. Simply copy the "rtracker.pp" to rest of the servers and execute:  $ semodule -i rtracker.pp
+
+Applying context:
+
+1) Apply default context to some directory (as specified in rules for parent directory):
+ # restorecon -R /var/www/somedirectory
+
+2) Apply some context:
+ # chcon -t httpd_sys_content_t /var/www/somedirectory
